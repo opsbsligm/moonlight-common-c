@@ -344,7 +344,8 @@ typedef struct _ML_INPUT_STREAM_CONTEXT {
         PML_CONNECTION_CONTEXT connectionContext;
         SOCKET inputSock;
         unsigned char currentAesIv[16];
-        bool initialized;
+        atomic_bool initialized;
+        atomic_int inputEdgeFailure;
         bool encryptedControlStream;
         bool needsBatchedScroll;
         int batchedScrollDelta;

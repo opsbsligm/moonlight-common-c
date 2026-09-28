@@ -491,6 +491,10 @@ typedef void (*ConnListenerConnectionTerminated)(int errorCode);
 // supported on GFE 3.22+.
 #define ML_ERROR_FRAME_CONVERSION -104
 
+// A keyboard or mouse button edge could not be queued reliably. Continuing
+// would leave the host with a pressed key/button that the client cannot release.
+#define ML_ERROR_INPUT_STREAM -105
+
 // This callback is invoked to log debug message
 typedef void (*ConnListenerLogMessage)(const char *format, ...);
 
