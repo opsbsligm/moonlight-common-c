@@ -1,0 +1,58 @@
+# GitLab CI for moonlight-common-c (C library, CMake).
+# Linux build (OpenSSL) on the untagged VM runner; Windows/macOS matrix stays
+# on GitHub Actions. GitLab is the source of truth, publish-github mirrors it.
+#
+# Note: requires cmake, ninja-build, g++, libssl-dev on the runner VM
+# (installed 2026-10-18 via apt).
+
+stages:
+  - build
+  - package
+
+variables:
+  CMAKE_GENERATOR: Ninja
+  CC: gcc
+  CXX: g++
+
+build-debug:
+  stage: build
+  script:
+    - git submodule update --init --recursive
+    - cmake -DCMAKE_BUILD_TYPE=Debug -B build_debug
+    - cmake --build build_debug
+    - |
+      if [ -d build_debug/CTestTestfile.cmake ]; then
+        ctest --test-dir build_debug --output-on-failure
+      else
+        echo "No CTest tests defined; compile gate only."
+      fi
+
+build-release:
+  stage: build
+  script:
+    - git submodule update --init --recursive
+    - cmake -DCMAKE_BUILD_TYPE=Release -B build_release
+    - cmake --build build_release
+    - ls -l build_release/libmoonlight-common-c*
+  artifacts:
+    paths:
+      - build_release/libmoonlight-common-c*
+    expire_in: 1 week
+
+# GitHub mirror sync (same pattern as moonlight-macos-enhanced).
+publish-github:
+  stage: package
+  dependencies: []
+  script:
+    - umask 077
+    - mkdir -p ~/.ssh && cat "$GH_DEPLOY_KEY" > ~/.ssh/gh_deploy
+    - chmod 600 ~/.ssh/gh_deploy
+    - |
+      cat > ~/.ssh/config <<EOF
+      Host github.com
+        HostName github.com
+        IdentityFile ~/.ssh/gh_deploy
+        StrictHostKeyChecking accept-new
+      EOF
+    - git remote add github git@github.com:opsbsligm/moonlight-common-c.git
+    - git push github --mirror
