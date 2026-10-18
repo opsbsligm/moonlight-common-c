@@ -5,10 +5,6 @@
 # Note: requires cmake, ninja-build, g++, libssl-dev on the runner VM
 # (installed 2026-10-18 via apt).
 
-concurrency:
-  group: $CI_PROJECT_PATH
-  cancel-in-progress: true
-
 stages:
   - build
   - package
