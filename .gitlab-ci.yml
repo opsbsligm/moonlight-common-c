@@ -55,4 +55,5 @@ publish-github:
         StrictHostKeyChecking accept-new
       EOF
     - git remote add github git@github.com:opsbsligm/moonlight-common-c.git
-    - git push github --mirror
+    - git push github --force --prune "refs/heads/*:refs/heads/*"
+    - git push github --force "refs/tags/*:refs/tags/*"
