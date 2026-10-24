@@ -20,9 +20,10 @@ build-debug:
     - if: '$CI_PIPELINE_SOURCE == "push"'
     - if: '$CI_PIPELINE_SOURCE == "web"'
   stage: build
+  timeout: 15 minutes
   tags: [linux-common]
   script:
-    - git submodule update --init --recursive
+    - git -c http.version=HTTP/1.1 submodule update --init --recursive --depth 1 --jobs 2
     - cmake -DCMAKE_BUILD_TYPE=Debug -B build_debug
     - cmake --build build_debug
     - |
@@ -38,9 +39,10 @@ build-release:
     - if: '$CI_PIPELINE_SOURCE == "push"'
     - if: '$CI_PIPELINE_SOURCE == "web"'
   stage: build
+  timeout: 15 minutes
   tags: [linux-common]
   script:
-    - git submodule update --init --recursive
+    - git -c http.version=HTTP/1.1 submodule update --init --recursive --depth 1 --jobs 2
     - cmake -DCMAKE_BUILD_TYPE=Release -B build_release
     - cmake --build build_release
     - ls -l build_release/libmoonlight-common-c*
