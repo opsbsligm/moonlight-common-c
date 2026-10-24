@@ -15,19 +15,27 @@ variables:
   CXX: g++
 
 build-debug:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
   stage: build
   script:
     - git submodule update --init --recursive
     - cmake -DCMAKE_BUILD_TYPE=Debug -B build_debug
     - cmake --build build_debug
     - |
-      if [ -d build_debug/CTestTestfile.cmake ]; then
+      if [ -f build_debug/CTestTestfile.cmake ]; then
         ctest --test-dir build_debug --output-on-failure
       else
         echo "No CTest tests defined; compile gate only."
       fi
 
 build-release:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
   stage: build
   script:
     - git submodule update --init --recursive
@@ -41,6 +49,9 @@ build-release:
 
 # GitHub mirror sync (same pattern as moonlight-macos-enhanced).
 publish-github:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
   stage: package
   dependencies: []
   script:
