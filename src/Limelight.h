@@ -841,6 +841,7 @@ int LiSendMouseButtonEvent(char action, int button);
 #define MODIFIER_CTRL 0x02
 #define MODIFIER_ALT 0x04
 #define MODIFIER_META 0x08
+#define MODIFIER_EXTENDED 0x10 // Extended key (0xE0 scancode prefix); see LiSendKeyboardEvent2()
 int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers);
 
 // Similar to LiSendKeyboardEvent() but allows the client to inform the host
@@ -940,6 +941,7 @@ int LiSendMultiControllerEvent(short controllerNumber, short activeGamepadMask,
 #define LI_CTYPE_XBOX 0x01
 #define LI_CTYPE_PS 0x02
 #define LI_CTYPE_NINTENDO 0x03
+#define LI_CTYPE_STEAM 0x04
 #define LI_CCAP_ANALOG_TRIGGERS                                                \
   0x01 // Reports values between 0x00 and 0xFF for trigger axes
 #define LI_CCAP_RUMBLE                                                         \
@@ -957,6 +959,8 @@ int LiSendMultiControllerEvent(short controllerNumber, short activeGamepadMask,
   0x40 // Reports battery state via LiSendControllerBatteryEvent()
 #define LI_CCAP_RGB_LED                                                        \
   0x80 // Can set RGB LED state via ConnListenerSetControllerLED()
+#define LI_CCAP_DUAL_TOUCHPAD                                                  \
+  0x100 // Reports touchpad events from 2 separate touchpads
 int LiSendControllerArrivalEvent(uint8_t controllerNumber,
                                  uint16_t activeGamepadMask, uint8_t type,
                                  uint32_t supportedButtonFlags,
@@ -975,6 +979,12 @@ int LiSendControllerArrivalEvent(uint8_t controllerNumber,
 int LiSendControllerTouchEvent(uint8_t controllerNumber, uint8_t eventType,
                                uint32_t pointerId, float x, float y,
                                float pressure);
+// Like LiSendControllerTouchEvent(), but selects which touchpad the event is
+// for on controllers with dual touchpads (e.g. Steam Controller). Valid
+// indices: 0 (LI_CCAP_TOUCHPAD), 1 (LI_CCAP_DUAL_TOUCHPAD).
+int LiSendControllerTouchEvent2(uint8_t controllerNumber, uint8_t eventType,
+                                uint8_t touchpadIndex, uint32_t pointerId,
+                                float x, float y, float pressure);
 
 // This function allows clients to send controller-associated motion events to a
 // supported host.
