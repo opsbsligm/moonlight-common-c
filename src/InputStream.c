@@ -38,6 +38,7 @@
 #define INPUT_STREAM_TIMEOUT_SEC 10
 
 #define MAX_QUEUED_INPUT_PACKETS 150
+#define INPUT_EDGE_QUEUE_WAIT_MS 100
 
 #define PAYLOAD_SIZE(x) BE32((x)->packet.header.size)
 #define PACKET_SIZE(x) (PAYLOAD_SIZE(x) + sizeof(uint32_t))
@@ -109,7 +110,8 @@ static void attachScrollTraceMetadata(PML_INPUT_STREAM_CONTEXT ctx,
 int initializeInputStreamCtx(PML_INPUT_STREAM_CONTEXT ctx, PML_CONNECTION_CONTEXT connectionContext) {
   ctx->connectionContext = connectionContext;
   ctx->inputSock = INVALID_SOCKET;
-  ctx->initialized = false;
+  atomic_init(&ctx->initialized, false);
+  atomic_init(&ctx->inputEdgeFailure, 0);
   memcpy(ctx->currentAesIv, StreamConfig.remoteInputAesIv, sizeof(ctx->currentAesIv));
 
   // Set a high maximum queue size limit to ensure input isn't dropped
@@ -293,6 +295,53 @@ static PPACKET_HOLDER allocatePacketHolder(PML_INPUT_STREAM_CONTEXT ctx, int ext
     // Otherwise we'll have to allocate
     return malloc(sizeof(*holder));
   }
+}
+
+// Motion can be coalesced, but losing either edge of a key/button permanently
+// desynchronizes the host. Keep the same bounded FIFO and apply brief backpressure
+// to these edges. If the sender cannot recover, fail the session explicitly.
+// Notify on InputSend, like transport errors, never on a producer holding an
+// application lock or a UI queue that the disconnect callback may need.
+static void failInputStreamForLostEdge(PML_INPUT_STREAM_CONTEXT ctx) {
+  if (atomic_exchange(&ctx->initialized, false)) {
+    atomic_store(&ctx->inputEdgeFailure, ML_ERROR_INPUT_STREAM);
+    LbqSignalQueueUserWake(&ctx->packetQueue);
+  }
+}
+
+static bool reportInputEdgeFailureIfPending(PML_INPUT_STREAM_CONTEXT ctx) {
+  int error = atomic_exchange(&ctx->inputEdgeFailure, 0);
+  if (error == 0) {
+    return false;
+  }
+  Limelog("Input: reliable keyboard/mouse edge could not be queued; terminating stream\n");
+  ListenerCallbacks.connectionTerminated(error);
+  return true;
+}
+
+static int queueInputEdge(PML_INPUT_STREAM_CONTEXT ctx, PPACKET_HOLDER holder) {
+  uint64_t started = PltGetMillis();
+  int err;
+  do {
+    if (!atomic_load(&ctx->initialized)) {
+      err = LBQ_INTERRUPTED;
+      break;
+    }
+    err = LbqOfferQueueItem(&ctx->packetQueue, holder, &holder->entry);
+    if (err != LBQ_BOUND_EXCEEDED) {
+      break;
+    }
+    if (PltGetMillis() - started >= INPUT_EDGE_QUEUE_WAIT_MS) {
+      failInputStreamForLostEdge(ctx);
+      break;
+    }
+    PltSleepMs(1);
+  } while (true);
+
+  if (err != LBQ_SUCCESS) {
+    freePacketHolder(ctx, holder);
+  }
+  return err;
 }
 
 static bool scrollPacketInfoFromHolder(PPACKET_HOLDER holder, bool* horizontal, short* amount) {
@@ -546,6 +595,12 @@ static void inputSendThreadProc(void *context) {
     short scrollAmount;
 
     err = LbqWaitForQueueElement(&ctx->packetQueue, (void **)&holder);
+    if (reportInputEdgeFailureIfPending(ctx)) {
+      if (err == LBQ_SUCCESS) {
+        freePacketHolder(ctx, holder);
+      }
+      return;
+    }
     if (err != LBQ_SUCCESS) {
       return;
     }
@@ -1170,7 +1225,6 @@ int LiSendMouseMoveAsMousePositionEvent(short deltaX, short deltaY, short refere
 // Send a mouse button event to the streaming machine
 int LiSendMouseButtonEventCtx(PML_INPUT_STREAM_CONTEXT ctx, char action, int button) {
   PPACKET_HOLDER holder;
-  int err;
 
   if (!ctx->initialized) {
     return -2;
@@ -1178,6 +1232,7 @@ int LiSendMouseButtonEventCtx(PML_INPUT_STREAM_CONTEXT ctx, char action, int but
 
   holder = allocatePacketHolder(ctx, 0);
   if (holder == NULL) {
+    failInputStreamForLostEdge(ctx);
     return -1;
   }
 
@@ -1193,14 +1248,7 @@ int LiSendMouseButtonEventCtx(PML_INPUT_STREAM_CONTEXT ctx, char action, int but
       LE32(holder->packet.mouseButton.header.magic);
   holder->packet.mouseButton.button = (uint8_t)button;
 
-  err = LbqOfferQueueItem(&ctx->packetQueue, holder, &holder->entry);
-  if (err != LBQ_SUCCESS) {
-    LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
-    Limelog("Input queue reached maximum size limit\n");
-    freePacketHolder(ctx, holder);
-  }
-
-  return err;
+  return queueInputEdge(ctx, holder);
 }
 
 int LiSendMouseButtonEvent(char action, int button) {
@@ -1211,7 +1259,6 @@ int LiSendMouseButtonEvent(char action, int button) {
 int LiSendKeyboardEvent2Ctx(PML_INPUT_STREAM_CONTEXT ctx, short keyCode, char keyAction, char modifiers,
                          char flags) {
   PPACKET_HOLDER holder;
-  int err;
 
   if (!ctx->initialized) {
     return -2;
@@ -1219,6 +1266,7 @@ int LiSendKeyboardEvent2Ctx(PML_INPUT_STREAM_CONTEXT ctx, short keyCode, char ke
 
   holder = allocatePacketHolder(ctx, 0);
   if (holder == NULL) {
+    failInputStreamForLostEdge(ctx);
     return -1;
   }
 
@@ -1269,6 +1317,9 @@ int LiSendKeyboardEvent2Ctx(PML_INPUT_STREAM_CONTEXT ctx, short keyCode, char ke
       // No fixups
       break;
     }
+
+    // MODIFIER_EXTENDED is a Sunshine extension
+    modifiers &= ~MODIFIER_EXTENDED;
   }
 
   holder->packet.keyboard.header.size =
@@ -1279,14 +1330,7 @@ int LiSendKeyboardEvent2Ctx(PML_INPUT_STREAM_CONTEXT ctx, short keyCode, char ke
   holder->packet.keyboard.modifiers = modifiers;
   holder->packet.keyboard.zero2 = 0;
 
-  err = LbqOfferQueueItem(&ctx->packetQueue, holder, &holder->entry);
-  if (err != LBQ_SUCCESS) {
-    LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
-    Limelog("Input queue reached maximum size limit\n");
-    freePacketHolder(ctx, holder);
-  }
-
-  return err;
+  return queueInputEdge(ctx, holder);
 }
 
 int LiSendKeyboardEvent2(short keyCode, char keyAction, char modifiers, char flags) {
@@ -1314,7 +1358,7 @@ int LiSendUtf8TextEventCtx(PML_INPUT_STREAM_CONTEXT ctx, const char *text, unsig
     return -1;
   }
 
-  holder->channelId = CTRL_CHANNEL_UTF8;
+  holder->channelId = CTRL_CHANNEL_KEYBOARD;
   holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
 
   // Magic + string length
@@ -1854,6 +1898,11 @@ int LiSendControllerArrivalEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t contro
   // Sunshine supports up to 16 controllers
   controllerNumber %= MAX_GAMEPADS;
 
+  // Always set the older touchpad cap if we have dual touchpads
+  if (capabilities & LI_CCAP_DUAL_TOUCHPAD) {
+    capabilities |= LI_CCAP_TOUCHPAD;
+  }
+
   // The arrival event is only supported by Sunshine
   if (IS_SUNSHINE()) {
     holder = allocatePacketHolder(ctx, 0);
@@ -1897,9 +1946,9 @@ int LiSendControllerArrivalEvent(uint8_t controllerNumber,
     return LiSendControllerArrivalEventCtx(LiGetEffectiveInputContext(), controllerNumber, activeGamepadMask, type, supportedButtonFlags, capabilities);
 }
 
-int LiSendControllerTouchEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t controllerNumber, uint8_t eventType,
-                               uint32_t pointerId, float x, float y,
-                               float pressure) {
+int LiSendControllerTouchEvent2Ctx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t controllerNumber, uint8_t eventType,
+                                   uint8_t touchpadIndex, uint32_t pointerId, float x, float y,
+                                   float pressure) {
   PPACKET_HOLDER holder;
   int err;
 
@@ -1933,8 +1982,9 @@ int LiSendControllerTouchEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t controll
   holder->packet.controllerTouch.header.magic = LE32(SS_CONTROLLER_TOUCH_MAGIC);
   holder->packet.controllerTouch.controllerNumber = controllerNumber;
   holder->packet.controllerTouch.eventType = eventType;
-  memset(holder->packet.controllerTouch.zero, 0,
+  memset(&holder->packet.controllerTouch.zero, 0,
          sizeof(holder->packet.controllerTouch.zero));
+  holder->packet.controllerTouch.touchpadIndex = touchpadIndex;
   holder->packet.controllerTouch.pointerId = LE32(pointerId);
   floatToNetfloat(x, holder->packet.controllerTouch.x);
   floatToNetfloat(y, holder->packet.controllerTouch.y);
@@ -1950,10 +2000,22 @@ int LiSendControllerTouchEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t controll
   return err;
 }
 
+int LiSendControllerTouchEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t controllerNumber, uint8_t eventType,
+                                  uint32_t pointerId, float x, float y,
+                                  float pressure) {
+    return LiSendControllerTouchEvent2Ctx(ctx, controllerNumber, eventType, 0, pointerId, x, y, pressure);
+}
+
 int LiSendControllerTouchEvent(uint8_t controllerNumber, uint8_t eventType,
                                uint32_t pointerId, float x, float y,
                                float pressure) {
     return LiSendControllerTouchEventCtx(LiGetEffectiveInputContext(), controllerNumber, eventType, pointerId, x, y, pressure);
+}
+
+int LiSendControllerTouchEvent2(uint8_t controllerNumber, uint8_t eventType,
+                                uint8_t touchpadIndex, uint32_t pointerId,
+                                float x, float y, float pressure) {
+    return LiSendControllerTouchEvent2Ctx(LiGetEffectiveInputContext(), controllerNumber, eventType, touchpadIndex, pointerId, x, y, pressure);
 }
 
 int LiSendControllerMotionEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t controllerNumber, uint8_t motionType,
