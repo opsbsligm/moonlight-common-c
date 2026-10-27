@@ -180,6 +180,7 @@ static const short packetTypesGen3[] = {
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
+    -1,     // Set Adaptive Triggers (unused)
     -1,     // Clipboard sync (unused)
 };
 static const short packetTypesGen4[] = {
@@ -195,6 +196,7 @@ static const short packetTypesGen4[] = {
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
+    -1,     // Set Adaptive Triggers (unused)
     -1,     // Clipboard sync (unused)
 };
 static const short packetTypesGen5[] = {
@@ -210,6 +212,7 @@ static const short packetTypesGen5[] = {
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
+    -1,     // Set Adaptive Triggers (unused)
     -1,     // Clipboard sync (unused)
 };
 static const short packetTypesGen7[] = {
@@ -244,6 +247,22 @@ static const short packetTypesGen7Enc[] = {
     0x5503, // Set Adaptive Triggers (Sunshine protocol extension)
     SS_CLIPBOARD_PTYPE, // Clipboard sync (Sunshine protocol extension)
 };
+
+// Every generator table is indexed by the IDX_ macros above, so each one must cover the
+// highest index in use. Upstream hit this when IDX_DS_ADAPTIVE_TRIGGERS was added without a
+// matching sentinel in packetTypesGen3..5, and our own IDX_CLIPBOARD widened the gap by one
+// more slot. A missing entry is not a benign zero: the table is read on the control path, so
+// the shortfall reads past the end of the array. Binding the size to the largest index turns
+// the next added IDX_ into a compile error instead of a silent overrun.
+#define ASSERT_CONTROL_TABLE_SIZE(table) \
+    _Static_assert(sizeof(table) / sizeof((table)[0]) == IDX_CLIPBOARD + 1, \
+                   #table " must have one entry per control packet index")
+
+ASSERT_CONTROL_TABLE_SIZE(packetTypesGen3);
+ASSERT_CONTROL_TABLE_SIZE(packetTypesGen4);
+ASSERT_CONTROL_TABLE_SIZE(packetTypesGen5);
+ASSERT_CONTROL_TABLE_SIZE(packetTypesGen7);
+ASSERT_CONTROL_TABLE_SIZE(packetTypesGen7Enc);
 
 static const char requestIdrFrameGen3[] = { 0, 0 };
 static const int startBGen3[] = { 0, 0, 0, 0xa };
@@ -1108,6 +1127,20 @@ static int ignoreDisconnectIntercept(ENetHost* host, ENetEvent* event) {
     if (host->receivedDataLength == sizeof(ENetProtocolHeader) + sizeof(ENetProtocolDisconnect)) {
         ENetProtocolHeader* protoHeader = (ENetProtocolHeader*)host->receivedData;
         ENetProtocolDisconnect* disconnect = (ENetProtocolDisconnect*)(protoHeader + 1);
+        enet_uint16 peerID = ENET_NET_TO_HOST_16(protoHeader->peerID);
+        enet_uint8 sessionID = (peerID & ENET_PROTOCOL_HEADER_SESSION_MASK) >> ENET_PROTOCOL_HEADER_SESSION_SHIFT;
+
+        peerID &= ~(ENET_PROTOCOL_HEADER_FLAG_MASK | ENET_PROTOCOL_HEADER_SESSION_MASK);
+
+        // This runs before ENet validates the packet at all, so only act on disconnects
+        // that are addressed to our peer and come from the address we're talking to.
+        // Anything else is left for ENet's own processing.
+        if (ctx == NULL || ctx->peer == NULL ||
+            peerID != ctx->peer->incomingPeerID ||
+            sessionID != ctx->peer->incomingSessionID ||
+            !enet_address_equal(&host->receivedPeerAddress, &ctx->peer->address)) {
+            return 0;
+        }
 
         if ((disconnect->header.command & ENET_PROTOCOL_COMMAND_MASK) == ENET_PROTOCOL_COMMAND_DISCONNECT) {
             Limelog("ENet disconnect event pending\n");
@@ -1826,7 +1859,7 @@ static void lossStatsThreadFunc(void* context) {
         char periodicPingPayload[8];
 
         BbInitializeWrappedBuffer(&byteBuffer, periodicPingPayload, 0, sizeof(periodicPingPayload), BYTE_ORDER_LITTLE);
-        BbPut16(&byteBuffer, 4); // Length of payload
+        BbPut32(&byteBuffer, 4); // Length of payload
         BbPut32(&byteBuffer, 0); // Timestamp?
 
         while (!PltIsThreadInterrupted(&ctx->lossStatsThread)) {
