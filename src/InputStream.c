@@ -567,6 +567,83 @@ static void floatToNetfloat(float in, netfloat out) {
   }
 }
 
+// Returns the length in bytes of the UTF-8 code point at the given offset in the
+// text, or 0 if the byte at that offset does not start a valid UTF-8 code point.
+// Kept free of logging on purpose: Limelog() expands through the ctx macro here, so
+// a helper without the context in scope cannot call it. Callers log the rejected byte.
+static uint32_t getUtf8CodePointLength(const char *utf8Text, uint32_t offset) {
+  uint8_t firstByte = (uint8_t)utf8Text[offset];
+  uint32_t codePointLength;
+
+  if ((firstByte & 0x80) == 0x00) {
+    // 1 byte code point
+    codePointLength = 1;
+  } else if ((firstByte & 0xE0) == 0xC0) {
+    // 2 byte code point
+    codePointLength = 2;
+  } else if ((firstByte & 0xF0) == 0xE0) {
+    // 3 byte code point
+    codePointLength = 3;
+  } else if ((firstByte & 0xF8) == 0xF0) {
+    // 4 byte code point
+    codePointLength = 4;
+  } else {
+    return 0;
+  }
+
+  return codePointLength;
+}
+
+// True when UTF-8 text for this host has to be sequenced against the keyboard
+// events that came before it on the control stream. That is a GFE behaviour: GFE
+// does not appear to synchronize keyboard and UTF-8 text events with each other,
+// so UTF-8 events sent alongside modifier keys interfere with them. Sunshine
+// processes them in order, so making Sunshine wait costs 50 ms per text block for
+// nothing.
+static bool unicodeNeedsControlStreamFlush(bool sunshineHost) {
+  return !sunshineHost;
+}
+
+// Returns how many bytes of the UTF-8 text starting at offset go into one
+// NV_UNICODE_PACKET, or 0 when no complete code point fits there and the send
+// should stop. Code points are never split across packets: a packet boundary in
+// the middle of a code point is a parsing error on the host.
+static uint32_t unicodeChunkLength(const char *text, uint32_t offset,
+                                   uint32_t remaining, bool dense) {
+  if (!dense) {
+    // One code point per packet. GFE only reads a single code point out of a
+    // packet, so packing more would silently drop the rest of the text.
+    uint32_t codePointLength = getUtf8CodePointLength(text, offset);
+    if (codePointLength == 0) {
+      return 0;
+    }
+    return codePointLength < remaining ? codePointLength : remaining;
+  }
+
+  // Sunshine reads as many code points as fit, so pack them and send a large text
+  // block as a handful of packets instead of one per code point.
+  uint32_t chunkLength = 0;
+  while (chunkLength < remaining) {
+    uint32_t codePointLength =
+        getUtf8CodePointLength(text, offset + chunkLength);
+    if (codePointLength == 0) {
+      break;
+    }
+    if (chunkLength + codePointLength > UTF8_TEXT_EVENT_MAX_COUNT) {
+      break;
+    }
+    chunkLength += codePointLength;
+  }
+
+  // No code point fit, so there is nothing left worth sending
+  if (chunkLength == 0) {
+    return 0;
+  }
+
+  // Clamp the chunk if the final code point is truncated
+  return chunkLength < remaining ? chunkLength : remaining;
+}
+
 // Input thread proc
 static void inputSendThreadProc(void *context) {
   PML_INPUT_STREAM_CONTEXT ctx = (PML_INPUT_STREAM_CONTEXT)context;
@@ -879,61 +956,51 @@ static void inputSendThreadProc(void *context) {
       PACKET_HOLDER splitPacket;
       uint32_t totalLength = PAYLOAD_SIZE(holder) - sizeof(uint32_t);
       uint32_t i = 0;
+      bool sunshineHost = IS_SUNSHINE();
 
-      // HACK: This is a workaround for the fact that GFE doesn't appear to
-      // synchronize keyboard and UTF-8 text events with each other. We need to
-      // make sure any previous keyboard events have been processed prior to
-      // sending these UTF-8 events to avoid interference between the two
-      // (especially with modifier keys).
-      flushInputOnControlStreamCtx(&ctx->connectionContext->controlContext);
-      while (!PltIsThreadInterrupted(&ctx->inputSendThread) &&
-             isControlDataInTransitCtx(&ctx->connectionContext->controlContext)) {
-        PltSleepMs(10);
+      // HACK: GFE needs the keyboard events that came before this text block to be
+      // fully processed on the control stream before any UTF-8 event of the block
+      // goes out, otherwise the two interfere (especially modifier keys). Sunshine
+      // has no such race, so it skips the flush and the 50 ms wait entirely.
+      if (unicodeNeedsControlStreamFlush(sunshineHost)) {
+        flushInputOnControlStreamCtx(&ctx->connectionContext->controlContext);
+        while (!PltIsThreadInterrupted(&ctx->inputSendThread) &&
+               isControlDataInTransitCtx(
+                   &ctx->connectionContext->controlContext)) {
+          PltSleepMs(10);
+        }
+
+        // Finally, sleep an additional 50 ms to allow the events to be processed
+        // by Windows
+        PltSleepMs(50);
       }
 
-      // Finally, sleep an additional 50 ms to allow the events to be processed
-      // by Windows
-      PltSleepMs(50);
-
-      // We send each Unicode code point individually. This way we can always
-      // ensure they will never straddle a packet boundary (which will cause a
-      // parsing error on the host).
       while (i < totalLength && !PltIsThreadInterrupted(&ctx->inputSendThread)) {
-        uint32_t codePointLength;
-        uint8_t firstByte = (uint8_t)holder->packet.unicode.text[i];
-        if ((firstByte & 0x80) == 0x00) {
-          // 1 byte code point
-          codePointLength = 1;
-        } else if ((firstByte & 0xE0) == 0xC0) {
-          // 2 byte code point
-          codePointLength = 2;
-        } else if ((firstByte & 0xF0) == 0xE0) {
-          // 3 byte code point
-          codePointLength = 3;
-        } else if ((firstByte & 0xF8) == 0xF0) {
-          // 4 byte code point
-          codePointLength = 4;
-        } else {
+        uint32_t remaining = totalLength - i;
+        uint32_t chunkLength = unicodeChunkLength(holder->packet.unicode.text, i,
+                                                  remaining, sunshineHost);
+        if (chunkLength == 0) {
+          // A code point can always fit on its own, so zero here means the byte at
+          // the cursor does not start a valid UTF-8 sequence. Same stop as before.
           Limelog("Invalid unicode code point starting byte: %02x\n",
-                  firstByte);
+                  (uint8_t)holder->packet.unicode.text[i]);
           break;
         }
 
-        // Use the original packet as a template and fixup to send one code
-        // point at a time
+        // Use the original packet as a template and fixup to send the chunk
         splitPacket = *holder;
         splitPacket.packet.unicode.header.size =
-            BE32(sizeof(uint32_t) + codePointLength);
+            BE32(sizeof(uint32_t) + chunkLength);
         memcpy(splitPacket.packet.unicode.text, &holder->packet.unicode.text[i],
-               codePointLength);
+               chunkLength);
 
-        // Encrypt and send the split packet
-        if (!sendInputPacket(ctx, &splitPacket, i + 1 < totalLength)) {
+        // Encrypt and send the chunk
+        if (!sendInputPacket(ctx, &splitPacket, i + chunkLength < totalLength)) {
           freePacketHolder(ctx, holder);
           return;
         }
 
-        i += codePointLength;
+        i += chunkLength;
       }
 
       freePacketHolder(ctx, holder);
