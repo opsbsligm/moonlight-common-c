@@ -68,6 +68,12 @@ typedef struct _PACKET_HOLDER {
   uint64_t scrollTraceLocalDispatchMs;
   uint64_t scrollTraceQueuedMs;
 
+  // Accumulated relative motion for this queued batch (upstream 448b2c6). It
+  // lives here rather than in a shared pending state so the sender can latch a
+  // snapshot and keep draining while producers keep moving the mouse.
+  int relMouseDeltaX;
+  int relMouseDeltaY;
+
   // The union must be the last member since we abuse the NV_UNICODE_PACKET
   // text field to store variable length data which gets split before being
   // sent to the host.
@@ -149,8 +155,8 @@ int initializeInputStreamCtx(PML_INPUT_STREAM_CONTEXT ctx, PML_CONNECTION_CONTEX
   ctx->absCurrentPosX = ctx->absCurrentPosY = 0.5f;
 
   memset(ctx->currentGamepadSensorState, 0, sizeof(ctx->currentGamepadSensorState));
-  memset(&ctx->currentRelativeMouseState, 0, sizeof(ctx->currentRelativeMouseState));
-  memset(&ctx->currentAbsoluteMouseState, 0, sizeof(ctx->currentAbsoluteMouseState));
+  ctx->currentQueuedRelativeMousePacket = NULL;
+  ctx->currentQueuedAbsoluteMousePacket = NULL;
   PltCreateMutex(&ctx->batchedInputMutex);
 
   return 0;
@@ -212,6 +218,10 @@ void destroyInputStreamCtx(PML_INPUT_STREAM_CONTEXT ctx) {
 
     entry = nextEntry;
   }
+
+  // The queued holders we were pointing at are gone with the queue.
+  ctx->currentQueuedRelativeMousePacket = NULL;
+  ctx->currentQueuedAbsoluteMousePacket = NULL;
 
   PltDeleteMutex(&ctx->batchedInputMutex);
 }
@@ -771,55 +781,57 @@ static void inputSendThreadProc(void *context) {
 
       PltLockMutex(&ctx->batchedInputMutex);
 
+      // This holder is no longer the pending batch: producers that move the
+      // mouse from now on get a fresh holder behind us in the queue.
+      if (holder == ctx->currentQueuedRelativeMousePacket) {
+        ctx->currentQueuedRelativeMousePacket = NULL;
+      }
+
+      // Latch the delta so further motion cannot extend this batch. Upstream
+      // 448b2c6: reading and clearing it here also lets the drain loop below do
+      // its network I/O without ever re-taking the batching lock, which is what
+      // used to let a fast producer keep the input thread inside this loop.
+      int deltaX = holder->relMouseDeltaX;
+      int deltaY = holder->relMouseDeltaY;
+
+      PltUnlockMutex(&ctx->batchedInputMutex);
+
       // Send as many packets as it takes to get the entire delta through
-      while (ctx->currentRelativeMouseState.deltaX != 0 ||
-             ctx->currentRelativeMouseState.deltaY != 0) {
+      while (deltaX != 0 || deltaY != 0) {
         bool more = false;
 
-        if (ctx->currentRelativeMouseState.deltaX < INT16_MIN) {
+        if (deltaX < INT16_MIN) {
           holder->packet.mouseMoveRel.deltaX = BE16(INT16_MIN);
-          ctx->currentRelativeMouseState.deltaX -= INT16_MIN;
+          deltaX -= INT16_MIN;
           more = true;
-        } else if (ctx->currentRelativeMouseState.deltaX > INT16_MAX) {
+        } else if (deltaX > INT16_MAX) {
           holder->packet.mouseMoveRel.deltaX = BE16(INT16_MAX);
-          ctx->currentRelativeMouseState.deltaX -= INT16_MAX;
+          deltaX -= INT16_MAX;
           more = true;
         } else {
-          holder->packet.mouseMoveRel.deltaX =
-              BE16(ctx->currentRelativeMouseState.deltaX);
-          ctx->currentRelativeMouseState.deltaX = 0;
+          holder->packet.mouseMoveRel.deltaX = BE16(deltaX);
+          deltaX = 0;
         }
 
-        if (ctx->currentRelativeMouseState.deltaY < INT16_MIN) {
+        if (deltaY < INT16_MIN) {
           holder->packet.mouseMoveRel.deltaY = BE16(INT16_MIN);
-          ctx->currentRelativeMouseState.deltaY -= INT16_MIN;
+          deltaY -= INT16_MIN;
           more = true;
-        } else if (ctx->currentRelativeMouseState.deltaY > INT16_MAX) {
+        } else if (deltaY > INT16_MAX) {
           holder->packet.mouseMoveRel.deltaY = BE16(INT16_MAX);
-          ctx->currentRelativeMouseState.deltaY -= INT16_MAX;
+          deltaY -= INT16_MAX;
           more = true;
         } else {
-          holder->packet.mouseMoveRel.deltaY =
-              BE16(ctx->currentRelativeMouseState.deltaY);
-          ctx->currentRelativeMouseState.deltaY = 0;
+          holder->packet.mouseMoveRel.deltaY = BE16(deltaY);
+          deltaY = 0;
         }
-
-        // Don't hold the batching lock while we're doing network I/O
-        PltUnlockMutex(&ctx->batchedInputMutex);
 
         // Encrypt and send the split packet
         if (!sendInputPacket(ctx, holder, more)) {
           freePacketHolder(ctx, holder);
           return;
         }
-
-        PltLockMutex(&ctx->batchedInputMutex);
       }
-
-      // The state change is no longer pending
-      ctx->currentRelativeMouseState.dirty = false;
-
-      PltUnlockMutex(&ctx->batchedInputMutex);
 
       lastMousePacketTime = now;
 
@@ -842,23 +854,13 @@ static void inputSendThreadProc(void *context) {
 
       PltLockMutex(&ctx->batchedInputMutex);
 
-      // Populate the packet with the latest state
-      holder->packet.mouseMoveAbs.x = BE16(ctx->currentAbsoluteMouseState.x);
-      holder->packet.mouseMoveAbs.y = BE16(ctx->currentAbsoluteMouseState.y);
-
-      // There appears to be a rounding error in GFE's scaling calculation which
-      // prevents the cursor from reaching the far edge of the screen when
-      // streaming at smaller resolutions with a higher desktop resolution (like
-      // streaming 720p with a desktop resolution of 1080p, or streaming
-      // 720p/1080p with a desktop resolution of 4K). Subtracting one from the
-      // reference dimensions seems to work around this issue.
-        holder->packet.mouseMoveAbs.width =
-          BE16(ctx->currentAbsoluteMouseState.width - 1);
-        holder->packet.mouseMoveAbs.height =
-          BE16(ctx->currentAbsoluteMouseState.height - 1);
-
-      // The state change is no longer pending
-      ctx->currentAbsoluteMouseState.dirty = false;
+      // The packet fields were filled by the producer that owned this holder, so
+      // the sender only has to release the pending pointer. Any position that
+      // arrives from now on gets a fresh holder instead of rewriting a packet that
+      // may already be on its way out (upstream 421bd74).
+      if (holder == ctx->currentQueuedAbsoluteMousePacket) {
+        ctx->currentQueuedAbsoluteMousePacket = NULL;
+      }
 
       PltUnlockMutex(&ctx->batchedInputMutex);
 
@@ -1134,6 +1136,7 @@ int stopInputStream(void) {
 int LiSendMouseMoveEventCtx(PML_INPUT_STREAM_CONTEXT ctx, short deltaX, short deltaY) {
   PPACKET_HOLDER holder;
   int err;
+  bool enqueueHolder = false;
 
   if (!ctx->initialized) {
     return -2;
@@ -1145,12 +1148,17 @@ int LiSendMouseMoveEventCtx(PML_INPUT_STREAM_CONTEXT ctx, short deltaX, short de
 
   PltLockMutex(&ctx->batchedInputMutex);
 
-  // Combine the previous deltas with the new one
-  ctx->currentRelativeMouseState.deltaX += deltaX;
-  ctx->currentRelativeMouseState.deltaY += deltaY;
+  // Relative motion and absolute motion are separate batches: starting one ends
+  // the other so the host never sees a stale absolute position after the pointer
+  // has already moved relatively (upstream 421bd74).
+  ctx->currentQueuedAbsoluteMousePacket = NULL;
 
-  // Queue a packet holder if this is the only pending relative mouse event
-  if (!ctx->currentRelativeMouseState.dirty) {
+  // Queue a packet holder if there is no pending relative mouse batch. Unlike
+  // upstream we allocate with the lock held, which removes the window where two
+  // producers both see no pending holder and one silently overwrites the
+  // other's pending pointer.
+  holder = ctx->currentQueuedRelativeMousePacket;
+  if (!holder) {
     holder = allocatePacketHolder(ctx, 0);
     if (holder == NULL) {
       PltUnlockMutex(&ctx->batchedInputMutex);
@@ -1173,15 +1181,33 @@ int LiSendMouseMoveEventCtx(PML_INPUT_STREAM_CONTEXT ctx, short deltaX, short de
       holder->packet.mouseMoveRel.header.magic = LE32(MOUSE_MOVE_REL_MAGIC);
     }
 
-    // Remaining fields are set in the input thread based on the latest
-    // currentRelativeMouseState values
+    // The deltas live in the holder itself, so the sender can latch a snapshot
+    // of them without a producer extending the batch underneath it.
+    holder->relMouseDeltaX = 0;
+    holder->relMouseDeltaY = 0;
 
+    ctx->currentQueuedRelativeMousePacket = holder;
+    enqueueHolder = true;
+  }
+
+  // Combine previous deltas with the new one
+  holder->relMouseDeltaX += deltaX;
+  holder->relMouseDeltaY += deltaY;
+
+  // The insert stays inside the batching lock, unlike upstream:
+  // LbqOfferQueueItem() never blocks, and dropping the lock here would let a
+  // mouse button event queue itself ahead of a motion batch that started before
+  // it, so the host would see the click land before the movement that caused it.
+  if (enqueueHolder) {
     err = LbqOfferQueueItem(&ctx->packetQueue, holder, &holder->entry);
-    if (err == LBQ_SUCCESS) {
-      ctx->currentRelativeMouseState.dirty = true;
-    } else {
+    if (err != LBQ_SUCCESS) {
       LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
       Limelog("Input queue reached maximum size limit\n");
+
+      if (ctx->currentQueuedRelativeMousePacket == holder) {
+        ctx->currentQueuedRelativeMousePacket = NULL;
+      }
+
       freePacketHolder(ctx, holder);
     }
   } else {
@@ -1203,6 +1229,7 @@ int LiSendMousePositionEventCtx(PML_INPUT_STREAM_CONTEXT ctx, short x, short y, 
                              short referenceHeight) {
   PPACKET_HOLDER holder;
   int err;
+  bool enqueueHolder = false;
 
   if (!ctx->initialized) {
     return -2;
@@ -1210,14 +1237,11 @@ int LiSendMousePositionEventCtx(PML_INPUT_STREAM_CONTEXT ctx, short x, short y, 
 
   PltLockMutex(&ctx->batchedInputMutex);
 
-  // Overwrite the previous mouse location with the new one
-  ctx->currentAbsoluteMouseState.x = x;
-  ctx->currentAbsoluteMouseState.y = y;
-  ctx->currentAbsoluteMouseState.width = referenceWidth;
-  ctx->currentAbsoluteMouseState.height = referenceHeight;
+  // Starting an absolute batch ends the pending relative batch (upstream 421bd74).
+  ctx->currentQueuedRelativeMousePacket = NULL;
 
-  // Queue a packet holder if this is the only pending absolute mouse event
-  if (!ctx->currentAbsoluteMouseState.dirty) {
+  holder = ctx->currentQueuedAbsoluteMousePacket;
+  if (!holder) {
     holder = allocatePacketHolder(ctx, 0);
     if (holder == NULL) {
       PltUnlockMutex(&ctx->batchedInputMutex);
@@ -1235,15 +1259,37 @@ int LiSendMousePositionEventCtx(PML_INPUT_STREAM_CONTEXT ctx, short x, short y, 
     holder->packet.mouseMoveAbs.header.magic = LE32(MOUSE_MOVE_ABS_MAGIC);
     holder->packet.mouseMoveAbs.unused = 0;
 
-    // Remaining fields are set in the input thread based on the latest
-    // currentAbsoluteMouseState values
+    ctx->currentQueuedAbsoluteMousePacket = holder;
+    enqueueHolder = true;
+  }
 
+  // Overwrite the pending location with the new one. The sender no longer fills
+  // these fields, so a position that arrives after a mouse button event can no
+  // longer be folded into the packet that was queued before that click.
+  holder->packet.mouseMoveAbs.x = BE16(x);
+  holder->packet.mouseMoveAbs.y = BE16(y);
+
+  // There appears to be a rounding error in GFE's scaling calculation which
+  // prevents the cursor from reaching the far edge of the screen when streaming
+  // at smaller resolutions with a higher desktop resolution (like streaming 720p
+  // with a desktop resolution of 1080p, or streaming 720p/1080p with a desktop
+  // resolution of 4K). Subtracting one from the reference dimensions seems to
+  // work around this issue.
+  holder->packet.mouseMoveAbs.width = BE16(referenceWidth - 1);
+  holder->packet.mouseMoveAbs.height = BE16(referenceHeight - 1);
+
+  // Same ordering contract as the relative producer: the insert happens inside
+  // the batching lock so a mouse button event cannot overtake this batch.
+  if (enqueueHolder) {
     err = LbqOfferQueueItem(&ctx->packetQueue, holder, &holder->entry);
-    if (err == LBQ_SUCCESS) {
-      ctx->currentAbsoluteMouseState.dirty = true;
-    } else {
+    if (err != LBQ_SUCCESS) {
       LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
       Limelog("Input queue reached maximum size limit\n");
+
+      if (ctx->currentQueuedAbsoluteMousePacket == holder) {
+        ctx->currentQueuedAbsoluteMousePacket = NULL;
+      }
+
       freePacketHolder(ctx, holder);
     }
   } else {
@@ -1314,6 +1360,16 @@ int LiSendMouseButtonEventCtx(PML_INPUT_STREAM_CONTEXT ctx, char action, int but
   holder->packet.mouseButton.header.magic =
       LE32(holder->packet.mouseButton.header.magic);
   holder->packet.mouseButton.button = (uint8_t)button;
+
+  // End both mouse motion batches so motion that happened before this click is
+  // sent before it and motion after the click lands in a fresh holder behind it
+  // (upstream 421bd74). A batch that is already queued still goes out; it just
+  // stops accepting appends, which is what used to let a click overtake the
+  // movement that caused it.
+  PltLockMutex(&ctx->batchedInputMutex);
+  ctx->currentQueuedRelativeMousePacket = NULL;
+  ctx->currentQueuedAbsoluteMousePacket = NULL;
+  PltUnlockMutex(&ctx->batchedInputMutex);
 
   return queueInputEdge(ctx, holder);
 }
