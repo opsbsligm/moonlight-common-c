@@ -339,6 +339,9 @@ int sendMicrophoneDataCtx(PML_MICROPHONE_STREAM_CONTEXT ctx, const char* data, i
 int sendMicrophoneOpusDataCtx(PML_MICROPHONE_STREAM_CONTEXT ctx, const unsigned char* opusData, int opusLength);
 
 // Input stream context (multi-stream scaffolding)
+// PACKET_HOLDER is defined in InputStream.c; the input context only needs a
+// pointer to it, so an incomplete type keeps the definition where it belongs.
+struct _PACKET_HOLDER;
 typedef struct _ML_INPUT_STREAM_CONTEXT {
         PML_CONNECTION_CONTEXT connectionContext;
         SOCKET inputSock;
@@ -363,15 +366,12 @@ typedef struct _ML_INPUT_STREAM_CONTEXT {
             float x, y, z;
             bool dirty;
         } currentGamepadSensorState[16][2];
-        struct {
-            int deltaX, deltaY;
-            bool dirty;
-        } currentRelativeMouseState;
-        struct {
-            int x, y;
-            int width, height;
-            bool dirty;
-        } currentAbsoluteMouseState;
+        // Pending motion batches live in the queued holder itself (upstream 421bd74):
+        // a producer only appends to a holder that is still unclaimed, so a mouse
+        // button event or a relative/absolute switch ends the batch instead of
+        // having its deltas folded into an already-queued packet.
+        struct _PACKET_HOLDER *currentQueuedRelativeMousePacket;
+        struct _PACKET_HOLDER *currentQueuedAbsoluteMousePacket;
         atomic_bool scrollTraceLoggingEnabled;
         atomic_bool scrollTraceAwaitingRender;
         atomic_bool scrollTraceLastDispatchHighRes;
